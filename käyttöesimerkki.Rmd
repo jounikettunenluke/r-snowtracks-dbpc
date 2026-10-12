@@ -1,0 +1,197 @@
+---
+title: "Lumijälki-indeksin laskenta Sulka-tietokannasta"
+subtitle: "R-esimerkki"
+output: html_document
+---
+
+## Tavoite
+
+Tässä esimerkissä:
+
+1. muodostetaan tietokantayhteys ilman, että salasanaa tallennetaan skriptiin tai globaaliin R-ympäristöön
+2. haetaan `sulka.export_lumijaljet`-näkymästä vain valitun lajin tiedot
+3. säilytetään tietokannasta haettu aineisto muuttumattomana
+4. lasketaan jälkien kertymisaika `snow_days`
+5. validoidaan laskennan lähtötiedot
+6. lasketaan lumijälki-indeksi muodossa **jälkiä / vrk / 10 km**.
+
+Indeksikaava on:
+
+```text
+n_tracks / snow_days / (covered_distance / 10000)
+```
+
+## 1. Pakettilataukset
+
+```{r packages, eval=FALSE}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(rstudioapi)
+```
+
+## 2. Turvallinen tietokantayhteys
+
+Käyttäjätunnus ja salasana kysytään yhteysfunktion sisällä. Salasanaa ei sijoiteta erilliseen globaaliin muuttujaan eikä kirjoiteta R-skriptiin.
+
+```{r connection, eval=FALSE}
+connect_sulka <- function() {
+  user <- readline("Käyttäjätunnus: ")
+
+  dbConnect(
+    RPostgres::Postgres(),
+    host = "lukedb2prod.ns.luke.fi",
+    port = 5432,
+    dbname = "rktl",
+    user = user,
+    password = rstudioapi::askForPassword("Tietokannan salasana")
+  )
+}
+
+con <- connect_sulka()
+```
+
+## 3. Lajin valinta ja aineiston haku
+
+Lajisuodatus tehdään jo SQL-kyselyssä. Näin R:ään haetaan vain analyysissä tarvittava aineisto.
+
+```{r query, eval=FALSE}
+valittu_laji <- "ahma"
+
+sql <- "
+SELECT *
+FROM sulka.export_lumijaljet
+WHERE laji = $1
+"
+
+lumijaljet_raw <- dbGetQuery(
+  con,
+  sql,
+  params = list(valittu_laji)
+)
+
+head(lumijaljet_raw)
+```
+
+`lumijaljet_raw` säilytetään muuttumattomana. Laskennalliset muuttujat muodostetaan erilliseen `lumijaljet`-data frameen.
+
+## 4. Kertymisaika ja lumijälki-indeksi
+
+`snow_days` kuvaa aikaa, jonka aikana uudet jäljet ovat ehtineet kertyä ennen varsinaista laskentaa. Kertymisen alku on viimeisin jäljet nollaava tapahtuma: esikierron päättyminen tai käytettävissä oleva lumisateen ajankohta.
+
+Koska `lumisateen_aika` sisältää tässä aineistossa päivämäärän, se muunnetaan aikamuotoon. Jos kellonaikaa ei ole, R tulkitsee ajan vuorokauden alkuun.
+
+```{r calculate, eval=FALSE}
+lumijaljet <- lumijaljet_raw %>%
+  mutate(
+    year = as.integer(vuosi),
+
+    lumisateen_aika_dt = as.POSIXct(
+      lumisateen_aika,
+      tz = "Europe/Helsinki"
+    ),
+
+    kertymisen_alku = case_when(
+      !is.na(esikierron_loppuaika) ~
+        pmax(
+          esikierron_loppuaika,
+          lumisateen_aika_dt,
+          na.rm = TRUE
+        ),
+      TRUE ~ lumisateen_aika_dt
+    ),
+
+    snow_days = as.numeric(
+      difftime(
+        laskennan_alkuaika,
+        kertymisen_alku,
+        units = "days"
+      )
+    ),
+
+    validointi = case_when(
+      is.na(n_tracks) ~ "Virhe: n_tracks puuttuu",
+      n_tracks < 0 ~ "Virhe: n_tracks < 0",
+      n_tracks != round(n_tracks) ~ "Virhe: n_tracks ei ole kokonaisluku",
+      is.na(covered_distance) ~ "Virhe: covered_distance puuttuu",
+      covered_distance <= 0 ~ "Virhe: covered_distance <= 0",
+      is.na(laskennan_alkuaika) ~ "Virhe: laskennan_alkuaika puuttuu",
+      is.na(kertymisen_alku) ~ "Virhe: kertymisen alkuaika puuttuu",
+      is.na(snow_days) ~ "Virhe: snow_days puuttuu",
+      !is.finite(snow_days) ~ "Virhe: snow_days ei ole kelvollinen",
+      snow_days <= 0 ~ "Virhe: snow_days <= 0",
+      TRUE ~ "OK"
+    ),
+
+    lumijalki_indeksi = if_else(
+      validointi == "OK",
+      n_tracks / snow_days / (covered_distance / 10000),
+      NA_real_
+    )
+  )
+```
+
+## 5. Tulosten tarkastelu
+
+Indeksi lasketaan vain riveille, joiden lähtötiedot läpäisevät validoinnin. Virheellisiä rivejä ei poisteta aineistosta, vaan indeksin arvoksi tulee `NA` ja syy näkyy `validointi`-sarakkeessa.
+
+```{r results, eval=FALSE}
+lumijaljet %>%
+  select(
+    knum,
+    year,
+    laji,
+    n_tracks,
+    covered_distance,
+    lumisateen_aika,
+    esikierron_loppuaika,
+    laskennan_alkuaika,
+    snow_days,
+    lumijalki_indeksi,
+    validointi
+  ) %>%
+  arrange(desc(year)) %>%
+  head(20)
+```
+
+## 6. Validoinnin tarkastelu
+
+Mahdolliset ongelmarivit voidaan tarkastella erikseen.
+
+```{r validation, eval=FALSE}
+lumijaljet %>%
+  filter(validointi != "OK") %>%
+  select(
+    knum,
+    year,
+    laji,
+    n_tracks,
+    covered_distance,
+    lumisateen_aika,
+    esikierron_loppuaika,
+    laskennan_alkuaika,
+    snow_days,
+    validointi
+  )
+
+lumijaljet %>%
+  count(validointi, sort = TRUE)
+```
+
+## 7. Yhteyden sulkeminen
+
+Tietokantayhteys suljetaan aina työn päättyessä.
+
+```{r disconnect, eval=FALSE}
+dbDisconnect(con)
+rm(con)
+```
+
+## Yhteenveto esitystä varten
+
+- Tietokannasta haetaan vain valittu laji.
+- Alkuperäinen `lumijaljet_raw` säilyy muuttumattomana.
+- `snow_days` ja lumijälki-indeksi muodostetaan R:ssä.
+- Lumijälki-indeksin yksikkö on jälkiä / vrk / 10 km.
+- Puutteellisia tai virheellisiä rivejä ei poisteta hiljaisesti, vaan ne merkitään validoinnissa.
+- Salasanaa ei kirjoiteta lähdekoodiin eikä tallenneta erilliseksi globaaliksi muuttujaksi.

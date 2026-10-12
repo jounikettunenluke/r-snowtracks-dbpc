@@ -1,0 +1,33 @@
+# R user files
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio project files
+.Rproj.user/
+*.Rproj
+
+# R package build artifacts
+.Rcheck/
+*.tar.gz
+*.Rcheck/
+
+# R Markdown and knitr cache
+*_files/
+_cache/
+
+# renv local library and state
+renv/library/
+renv/staging/
+renv/cache/
+
+# macOS and Windows metadata
+.DS_Store
+Thumbs.db
+
+# Local environment and editor files
+.env
+.vscode/
+.idea/
+*.html
+
